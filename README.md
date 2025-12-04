@@ -6,7 +6,7 @@ This project features intelligent query rewriting, hybrid retrieval (BM25 + Vect
 
 ## 🚀 Key Features
 
-* **100% Local Privacy:** Uses Llama 3.2 and Nomic Embeddings via Ollama. No data leaves your machine.
+* **100% Local Privacy:** Uses Llama 3.1 and Nomic Embeddings via Ollama. No data leaves your machine.
 * **Multi-User Caching:** Isolates cache data per user (e.g., `alice_cache.json`, `bob_cache.json`). Alice's previous answers speed up her future queries but remain invisible to Bob.
 * **Intelligent Query Rewriting:** Automatically transforms vague follow-up questions (e.g., "How much is it?") into standalone search queries based on chat history.
 * **Hybrid Retrieval:** Combines keyword search (BM25) with semantic search (ChromaDB) using Reciprocal Rank Fusion (RRF) for higher accuracy.
