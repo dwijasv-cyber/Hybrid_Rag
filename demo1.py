@@ -580,3 +580,4 @@ async def vision_endpoint(file: UploadFile = File(...), prompt: str = None):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+# Updated for AI Developer Portfolio - 2026
