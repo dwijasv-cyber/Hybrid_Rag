@@ -1,0 +1,6 @@
+__pycache__/
+.env
+chroma_db_ollama/
+user_caches/
+*.log
+.ipynb_checkpoints/
