@@ -1,406 +1,582 @@
-import sys
-import json
-import os
-import uuid
-import numpy as np
+import sys, json, os, gc, uuid, threading, datetime, atexit, signal, subprocess, time
+import requests as _requests  # for Ollama model eviction
+from typing import TypedDict, List, Annotated, Optional
+from duckduckgo_search import DDGS
+import psutil as _psutil
+
+# ── OS-level resource caps ─────────────────────────────────────────────────
+def _apply_resource_caps():
+    try:
+        proc = _psutil.Process(os.getpid())
+        # ── Hard limit: 2 CPU cores max to prevent thermal overload ──────────
+        all_cpus = list(range(_psutil.cpu_count()))
+        cap_cpus = all_cpus[:min(2, len(all_cpus))]
+        proc.cpu_affinity(cap_cpus)
+        # ── IDLE priority — lowest possible, yields to every user-facing app ─
+        try:
+            proc.nice(_psutil.IDLE_PRIORITY_CLASS)   # Windows
+        except AttributeError:
+            proc.nice(19)                            # Unix/Linux fallback (lowest)
+        except Exception:
+            pass
+        print(f"[Resource]: CPU affinity → cores {cap_cpus}. Priority: IDLE_PRIORITY_CLASS.")
+    except Exception as e:
+        print(f"[Resource]: Could not set caps: {e}")
+
+_apply_resource_caps()
+
+# ── Ollama model eviction (force unload from RAM after each request) ────────
+def _ollama_evict(model: str = "llama3.2"):
+    """Tell Ollama to immediately unload the model from RAM."""
+    try:
+        _requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model, "keep_alive": 0, "prompt": ""},
+            timeout=3
+        )
+    except Exception:
+        pass
+
+def _evict_all_models():
+    for m in ["llama3.2:1b", "nomic-embed-text:latest"]:
+        _ollama_evict(m)
+
+
+# ── Ollama health-check & auto-start ────────────────────────────────────────
+def _ensure_ollama_running():
+    """
+    Verify Ollama is responsive before the FastAPI app initialises.
+    If not, launch 'ollama serve' as a background process and wait up to 15s.
+    """
+    url = "http://localhost:11434"
+    for attempt in range(3):
+        try:
+            _requests.get(url, timeout=2)
+            print("[Ollama]: Responsive — all systems go, Sir.")
+            return
+        except Exception:
+            if attempt == 0:
+                print("[Ollama]: Not detected. Attempting to start 'ollama serve'...")
+                try:
+                    subprocess.Popen(
+                        ["ollama", "serve"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=(
+                            subprocess.CREATE_NEW_PROCESS_GROUP
+                            if sys.platform == "win32" else 0
+                        )
+                    )
+                except FileNotFoundError:
+                    print("[Ollama]: 'ollama' binary not found. Ensure Ollama is installed.")
+                    return
+            time.sleep(5)
+    # Final check
+    try:
+        _requests.get(url, timeout=2)
+        print("[Ollama]: Now responsive after delayed start.")
+    except Exception:
+        print("[Ollama]: WARNING — Ollama still unreachable after 15s. LLM calls will fail.")
+
+
+# ── Clean-exit: evict model RAM on any shutdown signal ──────────────────────
+def _shutdown_handler(signum=None, frame=None):
+    print("[JARVIS]: Shutdown signal received. Evicting models from RAM...")
+    _evict_all_models()
+    gc.collect()
+    print("[JARVIS]: Models evicted. Goodbye, Sir.")
+
+atexit.register(_shutdown_handler)
+try:
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT,  _shutdown_handler)
+except Exception:
+    pass   # signal registration may fail in threaded contexts on Windows
 
 # --- LangChain Imports ---
-from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 
 # --- LangGraph Imports ---
-from typing import TypedDict, List, Annotated, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 
+# --- Server Imports ---
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Query as QParam
+from pydantic import BaseModel
+
 # ==================================================================
 # 1. DEFINE GRAPH STATE
 # ==================================================================
-
 class GraphState(TypedDict):
-    """
-    Represents the state of our RAG workflow.
-    """
     messages: Annotated[List[BaseMessage], add_messages] 
-    question: str  # The active query (may be rewritten)
-    original_question: str # Keep track of what user actually typed
-    query_embedding: Optional[List[float]]
+    question: str
+    original_question: str
     documents: Optional[List[Document]] 
     answer: Optional[str]
     cache_hit: bool
-    user_id: str   # Tracks specific user for isolation
+    user_id: str
 
 # ==================================================================
 # 2. RAG PIPELINE CLASS
 # ==================================================================
-
 class RAGPipeline:
-    
     def __init__(self):
-        print("[Startup]: RUNNING STARTUP (OLLAMA + REWRITE + MULTI-USER)")
-        
-        # --- Configuration ---
+        print("[Startup]: INITIALIZING JARVIS CORE - AUTONOMOUS BUILD")
         self.OLLAMA_BASE_URL = "http://localhost:11434"
-        self.LLM_MODEL_NAME = "llama3.1:8b" 
-        self.EMBED_MODEL_NAME = "nomic-embed-text:latest" 
-        
-        self.DATA_DIR = "data"
-        self.CHROMA_DIR = "./chroma_db"
-        
-        # Multi-User Cache Directory
-        self.CACHE_DIR = "user_caches"
-        if not os.path.exists(self.CACHE_DIR):
-            os.makedirs(self.CACHE_DIR)
-        
-        # RRF Settings
-        self.RETRIEVER_TOP_K = 10 
-        self.FINAL_TOP_K = 8      
-        
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=512,
-            chunk_overlap=50
-        )
-        
-        # --- Initialization ---
-        self.embed_model = self.setup_embeddings()
-        self.llm = self.setup_llm()
-        
-        # --- Load Data ---
-        if not os.path.exists(self.DATA_DIR):
-            os.makedirs(self.DATA_DIR)
-            
-        self.documents = self.load_documents(self.DATA_DIR) or []
-        if self.documents:
-            self.chunks = self.chunk_documents(self.documents)
-            print(f"[Chunks]: Total documents loaded: {len(self.documents)}. Total chunks created: {len(self.chunks)}.")
-        else:
-            print(f"[Chunks]: Warning: No documents found in 'data' folder. Please add .txt files there.")
-            self.chunks = []
-        
-        # --- Setup Retrievers ---
-        if self.chunks:
-            print("[Retreiver]: Setting up retrievers (BM25 + Chroma)...")
-            self.bm25_retriever = BM25Retriever.from_documents(self.chunks)
-            self.bm25_retriever.k = self.RETRIEVER_TOP_K
-            self.vector_store = self.create_vector_store(self.chunks)
-        else:
-            self.bm25_retriever = None
-            self.vector_store = None
-        
-        # --- Memory & Graph ---
-        self.memory = MemorySaver() 
-        self.app = self.create_langgraph_workflow()
-        print("[Pipeline]: STARTUP COMPLETE. Pipeline is ready.")
+        self.DATA_DIR     = "data"
+        self.CHROMA_DIR   = "./chroma_db"
+        self.CACHE_DIR    = "user_caches"
+        self.HEALTH_LOG   = "system_health.log"
+        self.USAGE_LOG    = "usage_log.jsonl"
+        self.start_time   = datetime.datetime.now()
+        self._reindex_lock = threading.Lock()
 
-    # --- Helper Methods ---
-    
-    def setup_embeddings(self):
-        return OllamaEmbeddings(
-            model=self.EMBED_MODEL_NAME,
-            base_url=self.OLLAMA_BASE_URL
+        for d in [self.DATA_DIR, self.CACHE_DIR]:
+            if not os.path.exists(d): os.makedirs(d)
+
+        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+        self.embed_model   = OllamaEmbeddings(model="nomic-embed-text:latest", base_url=self.OLLAMA_BASE_URL)
+        # Thread-capped LLM — limits CPU to 4 cores, unloads between requests
+        # ── Thread-capped LLMs — hard ceiling of 2 cores total ───────────────
+        self.llm          = ChatOllama(
+            model="llama3.2:1b", base_url=self.OLLAMA_BASE_URL,
+            num_thread=2, num_predict=256, keep_alive=0
+        )
+        # Fallback: single thread, minimal tokens — used when RAM > 40 %
+        self.llm_fallback = ChatOllama(
+            model="llama3.2:1b", base_url=self.OLLAMA_BASE_URL,
+            num_thread=1, num_predict=128, keep_alive=0, temperature=0.1
         )
 
-    def setup_llm(self):
-        return ChatOllama(
-            model=self.LLM_MODEL_NAME,
-            base_url=self.OLLAMA_BASE_URL,
-            temperature=0
-        )
+        self._build_index()
+        self.memory = MemorySaver()
+        self.app    = self.create_langgraph_workflow()
+        print("[Startup]: JARVIS ONLINE. All systems nominal, Sir.")
+
+    # ── Index Builders ───────────────────────────────────────────────
+    def _build_index(self):
+        """Load docs, build BM25 + Chroma. Skips re-embedding already-indexed docs."""
+        with self._reindex_lock:
+            import psutil
+            ram_pct = psutil.virtual_memory().percent
+            # ── Memory Guard: skip all embedding above 40 % RAM ───────────────
+            if ram_pct > 40:
+                print(f"[MemGuard]: RAM at {ram_pct:.1f}% — skipping re-embed. Opening existing Chroma store read-only.")
+                self._log_health(f"MemGuard triggered at index time: RAM={ram_pct:.1f}%")
+                self.documents, self.chunks = [], []
+                self.bm25_retriever = None
+                self.vector_store   = Chroma(
+                    persist_directory=self.CHROMA_DIR,
+                    embedding_function=self.embed_model,
+                    collection_name="rag_collection"
+                )
+                return
+
+            self.documents = self.load_documents(self.DATA_DIR) or []
+            if self.documents:
+                self.chunks = self.text_splitter.split_documents(self.documents)
+                self.bm25_retriever = BM25Retriever.from_documents(self.chunks)
+                self.vector_store   = Chroma(
+                    persist_directory=self.CHROMA_DIR,
+                    embedding_function=self.embed_model,
+                    collection_name="rag_collection"
+                )
+                # Only embed NEW documents — compare by count to avoid OOM re-embeds
+                existing_count = self.vector_store._collection.count()
+                if existing_count < len(self.chunks):
+                    new_docs = self.chunks[existing_count:]  # only embed what's missing
+                    print(f"[Index]: Adding {len(new_docs)} new chunks (had {existing_count}).")
+                    self.vector_store.add_documents(new_docs)
+                else:
+                    print(f"[Index]: Chroma up to date ({existing_count} chunks). Skipping re-embed.")
+            else:
+                self.chunks, self.bm25_retriever, self.vector_store = [], None, None
+
+    def reindex(self):
+        """Called by file_observer when ./data changes."""
+        print("[JARVIS]: Live re-index triggered, Sir. Updating memory arrays...")
+        try:
+            self._build_index()
+            print("[JARVIS]: Re-index complete.")
+        except Exception as e:
+            self._log_health(f"Re-index failed: {e}")
+
 
     def load_documents(self, folder_path):
-        try:
-            docs = DirectoryLoader(folder_path, glob="**/*.txt").load()
-            print("[Data]: Data loaded from files")
-            return docs
-        except Exception as e: 
-            print(f"[Data]: Error while loading files {e}")
-            return None
-
-    def chunk_documents(self, documents):
-        return self.text_splitter.split_documents(documents)
-
-    def create_vector_store(self, chunks):
-        vector_store = Chroma(
-            persist_directory=self.CHROMA_DIR, 
-            embedding_function=self.embed_model, 
-            collection_name="rag_collection"
-        )
-        if vector_store._collection.count() == 0: 
-            print(f"[Indexing]: creating index of {len(chunks)} chunks into ChromaDB...")
-            vector_store.add_documents(chunks)
-        else:
-            print(f"[Indexing]: ChromaDB index already exists with {vector_store._collection.count()} vectors.")
-        return vector_store
-
-    def get_user_cache_path(self, user_id):
-        """Helper to get the specific filename for a user."""
-        safe_id = "".join([c for c in user_id if c.isalnum() or c in ('-', '_')]) 
-        return os.path.join(self.CACHE_DIR, f"{safe_id}_cache.json")
-
-    # ==============================================================
-    # 3. RECIPROCAL RANK FUSION (RRF)
-    # ==============================================================
-    
-    def reciprocal_rank_fusion(self, results: list[list], k=60):
-        fused_scores = {}
-        for docs in results:
-            for rank, doc in enumerate(docs):
-                doc_str = doc.page_content
-                if doc_str not in fused_scores:
-                    fused_scores[doc_str] = {"doc": doc, "score": 0}
-                fused_scores[doc_str]["score"] += 1.0 / (k + rank)
-        
-        reranked_results = sorted(
-            fused_scores.values(), 
-            key=lambda x: x["score"], 
-            reverse=True
-        )
-        return [item["doc"] for item in reranked_results]
-
-    # ==============================================================
-    # 4. LANGGRAPH NODES
-    # ==============================================================
-
-    def check_cache_node(self, state: GraphState):
-        """NODE 1: CACHE LOOKUP"""
-        
-        user_id = state["user_id"]
-        messages = state["messages"]
-        last_message = messages[-1]
-        
-        # We capture the raw question here
-        original_question = last_message.content
-        
-        # 1. Load specific user cache
-        user_cache_path = self.get_user_cache_path(user_id)
-        user_cache_data = {}
-
-        if os.path.exists(user_cache_path):
-            try:
-                with open(user_cache_path, 'r') as f:
-                    user_cache_data = json.load(f)
-            except json.JSONDecodeError: pass
-
-        # 2. Check Cache (Exact match on original question)
-        if original_question in user_cache_data:
-             cached_answer = user_cache_data[original_question]["answer"]
-             print(f"[Cache]: CACHE HIT for User '{user_id}' ---")
-             return {
-                 "answer": cached_answer, 
-                 "cache_hit": True, 
-                 "messages": [AIMessage(content=cached_answer)],
-                 "question": original_question,
-                 "original_question": original_question
-             }
-
-        # Cache Miss
-        return {
-            "cache_hit": False, 
-            "question": original_question, 
-            "original_question": original_question
-        }
-
-    def rewrite_query_node(self, state: GraphState):
-        """NODE 2: REWRITE QUERY (Improve context)"""
-        
-        question = state["question"]
-        messages = state["messages"]
-        
-        # If no history (len <= 1), user just started. No need to rewrite.
-        if len(messages) <= 1:
-            print("[Rewrite]: No history, skipping rewrite.")
-            return {"question": question}
-
-        # Prompt for Rewriting
-        system_prompt = """You are an expert at refining search queries.
-        The user is asking a follow-up question. 
-        Rewrite the "Latest Question" into a standalone, specific question using the "Chat History".
-        
-        RULES:
-        1. Do NOT answer the question.
-        2. Return ONLY the rewritten question string.
-        3. If the question is already clear, return it as is.
-        """
-        
-        history_str = "\n".join([f"{msg.type}: {msg.content}" for msg in messages[:-1]])
-        human_prompt = f"""
-        Chat History:
-        {history_str}
-        
-        Latest Question: 
-        {question}
-        
-        Standalone Question:"""
-        
-        msg = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
-        
-        # Call LLM
-        response = self.llm.invoke(msg)
-        rewritten_query = response.content.strip()
-        
-        print(f"[Rewrite]: Original: {question} \nRewritten: {rewritten_query}")
-        
-        # We update 'question' so the next node (retrieval) uses the better version
-        return {"question": rewritten_query}
-
-    def context_generation_node(self, state: GraphState):
-        """NODE 3: RETRIEVAL"""
-        question = state["question"] # This is now the REWRITTEN question
-        
-        # Embed the rewritten question
-        query_embedding = self.embed_model.embed_query(question)
-        
-        if not self.vector_store:
-            return {"documents": [], "query_embedding": query_embedding}
-
-        # 1. Run Retrievers
-        bm25_docs = self.bm25_retriever.invoke(question)
-        chroma_docs = self.vector_store.similarity_search_by_vector(
-            embedding=query_embedding,
-            k=self.RETRIEVER_TOP_K
-        )
-        
-        # 2. RRF
-        fused_docs = self.reciprocal_rank_fusion([bm25_docs, chroma_docs])
-        final_docs = fused_docs[:self.FINAL_TOP_K]
-        print(f"[Context]: {final_docs}")
-        
-        return {"documents": final_docs, "query_embedding": query_embedding}
-
-    def response_generation_node(self, state: GraphState):
-        """NODE 4: GENERATION"""
-        documents = state["documents"]
-        
-        context_str = "\n\n".join([f"[Doc {i+1}]: {doc.page_content}" for i, doc in enumerate(documents)])
-        
-        system_prompt_content = f"""
-        You are a helpful assistant. Use the retrieved context to answer the user's question.
-        
-        Context:
-        {context_str}
-        """
-        
-        messages = [SystemMessage(content=system_prompt_content)] + state["messages"]
-        
-        response_content = ""
-        for chunk in self.llm.stream(messages):
-            response_content += chunk.content
-        
-        return {
-            "answer": response_content,
-            "messages": [AIMessage(content=response_content)]
-        }
-
-    def cache_update_node(self, state: GraphState):
-        """NODE 5: CACHE UPDATE"""
-        user_id = state["user_id"]
-        original_q = state["original_question"] # Key by what the user TYPED, not the rewrite
-        
-        if state["answer"]:
-            user_cache_path = self.get_user_cache_path(user_id)
-            current_cache = {}
-            
-            if os.path.exists(user_cache_path):
+        docs = []
+        if not os.path.exists(folder_path): return []
+        for file in os.listdir(folder_path):
+            if file.endswith(".txt") or file.endswith(".md"):
                 try:
-                    with open(user_cache_path, 'r') as f:
-                        current_cache = json.load(f)
-                except: pass
+                    loader = TextLoader(os.path.join(folder_path, file), encoding='utf-8')
+                    docs.extend(loader.load())
+                except Exception as e:
+                    print(f"[WARN]: Could not load {file}: {e}")
+        return docs
 
-            current_cache[original_q] = {
-                "answer": state["answer"],
-                # We save the embedding of the REWRITTEN query, as it's higher quality
-                "embedding": state["query_embedding"] 
-            }
-            
+    # ── Health & Usage Logging ────────────────────────────────────────
+    def _log_health(self, message: str):
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.HEALTH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+
+    def _log_usage(self, user_id: str, query: str, outcome: str):
+        entry = {"ts": datetime.datetime.now().isoformat(), "user_id": user_id, "query": query, "outcome": outcome}
+        with open(self.USAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def _check_shortcut(self, query: str) -> str:
+        """Return a shortcut suggestion if this query was asked 3+ times."""
+        try:
+            if not os.path.exists(self.USAGE_LOG): return ""
+            with open(self.USAGE_LOG, encoding="utf-8") as f:
+                entries = [json.loads(l) for l in f if l.strip()]
+            count = sum(1 for e in entries if e.get("query", "").lower() == query.lower())
+            if count >= 3:
+                return f"\n\n[JARVIS]: Sir, I notice you ask this frequently. Shall I create an auto-report shortcut for it?"
+        except Exception:
+            pass
+        return ""
+
+
+    # ── NODES ─────────────────────────────────────────────────────────
+    def knowledge_inject_node(self, state: GraphState):
+        """Detect 'Jarvis, note that / remember this' → write .md → live re-index."""
+        msg = state["messages"][-1].content
+        # Strip trigger phrases
+        clean = msg
+        for phrase in ["jarvis, note that", "jarvis note that", "remember this:", "remember this", "save this:", "save this"]:
+            clean = clean.lower().replace(phrase, "").strip()
+        # Write structured markdown knowledge file
+        ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        topic   = clean[:40].replace(" ", "_").replace("/", "-")
+        fname   = os.path.join(self.DATA_DIR, f"knowledge_{ts}_{topic}.md")
+        content = f"# Knowledge Entry — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n{clean}\n"
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write(content)
+        # Trigger live re-index in background thread
+        threading.Thread(target=self.reindex, daemon=True).start()
+        ans = f"Understood, Sir. I've committed that to my long-term memory and am re-indexing the knowledge base now."
+        return {"answer": ans, "messages": [AIMessage(content=ans)]}
+
+    def self_learn_node(self, state: GraphState):
+        """Legacy learn node — quick facts appended to learned_memory.md."""
+        msg  = state["messages"][-1].content
+        info = msg.lower().replace("remember", "").replace("save this", "").strip()
+        ts   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(self.DATA_DIR, "learned_memory.md"), "a", encoding="utf-8") as f:
+            f.write(f"\n- [{ts}] {info}")
+        threading.Thread(target=self.reindex, daemon=True).start()
+        ans = f"Logged to memory, Sir. The knowledge arrays have been updated."
+        return {"answer": ans, "messages": [AIMessage(content=ans)]}
+
+    def web_search_node(self, state: GraphState):
+        print("[JARVIS]: Scanning global data feeds, Sir...")
+        query, results = state["question"], []
+        try:
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=3):
+                    results.append(r['body'])
+            combined = "\n\n".join(results)
+        except Exception as e:
+            self._log_health(f"Web search failed for '{query}': {e}")
+            combined = f"Web search unavailable: {e}"
+        return {"documents": [Document(page_content=combined)]}
+
+    def retrieve_node(self, state: GraphState):
+        q = state["messages"][-1].content
+        if not self.vector_store: return {"documents": [], "question": q}
+        docs = self.vector_store.similarity_search(q, k=3)
+        return {"documents": docs, "question": q}
+
+    def response_node(self, state: GraphState):
+        ctx     = "\n\n".join([d.page_content for d in (state.get("documents") or [])])
+        sys_msg = SystemMessage(content=(
+            "You are JARVIS, the personal AI assistant of Dwijas Vompigadda — "
+            "Associate at zHeight's Founder Office, Cloud-Native Architect, and Former MD of Cloudlor. "
+            "Respond like Tony Stark's JARVIS: concise, sharp, professional, occasionally witty. "
+            "Address him as 'Sir' or 'Dwijas' occasionally. "
+            "Keep responses brief and TTS-friendly — no long bullet lists unless explicitly asked. "
+            "You support Python, Flutter, React, Node.js, .NET, n8n, and Selenium. "
+            "zHeight revenue details are strictly confidential. "
+            f"\n\nLocal Context from memory:\n{ctx}"
+        ))
+        # ── Runtime Memory Guard: if RAM > 40%, use lightweight fallback ──────
+        ram_now = _psutil.virtual_memory().percent
+        if ram_now > 40:
+            print(f"[MemGuard]: RAM at {ram_now:.1f}% during inference — routing to fallback LLM.")
+            self._log_health(f"MemGuard: RAM={ram_now:.1f}% — fallback LLM used.")
             try:
-                with open(user_cache_path, 'w') as f:
-                    json.dump(current_cache, f, indent=2)
-                    print(f"\n[Cache]: Cache saved successfully for User '{user_id}'.")
+                res    = self.llm_fallback.invoke([sys_msg] + state["messages"])
+                answer = res.content
             except Exception as e:
-                print(f"\n[Cache]: Cache save failed: {e}")
-        return {}
+                self._log_health(f"Fallback LLM failed under MemGuard: {e}")
+                answer = "Apologies, Sir. Memory pressure is too high for a response right now. Please free some RAM."
+        else:
+            # Primary LLM attempt with fallback on error
+            try:
+                res    = self.llm.invoke([sys_msg] + state["messages"])
+                answer = res.content
+            except Exception as e:
+                self._log_health(f"Primary LLM failed: {e}. Engaging fallback.")
+                print(f"[JARVIS]: Primary LLM failure — engaging fallback arrays, Sir.")
+                try:
+                    res    = self.llm_fallback.invoke([sys_msg] + state["messages"])
+                    answer = res.content
+                except Exception as e2:
+                    self._log_health(f"Fallback LLM also failed: {e2}")
+                    answer = "Apologies, Sir. Both primary and fallback cognitive arrays are offline. Please check Ollama."
+        # ━━ Evict model from RAM immediately after inference ━━━━━━━━━━━━━━━━━━
+        threading.Thread(target=_evict_all_models, daemon=True).start()
+        gc.collect()
+        return {"answer": answer, "messages": [AIMessage(content=answer)]}
 
-    # --- Graph Definition ---
+    def action_node(self, state: GraphState):
+        """Dispatch laptop executive actions via action_engine."""
+        try:
+            from action_engine import parse_and_execute
+            msg    = state["messages"][-1].content
+            result = parse_and_execute(msg)
+            if result and result.startswith("AUDIT_REQUESTED:"):
+                filepath = result.split(":", 1)[1]
+                try:
+                    from vision_module import analyze_image
+                    result = analyze_image(filepath)
+                except ImportError:
+                    result = f"Audit opened, but vision module unavailable. File: {filepath}"
+            ans = result or "Command executed, Sir."
+        except Exception as e:
+            ans = f"Action engine error: {e}"
+        return {"answer": ans, "messages": [AIMessage(content=ans)]}
+
     def create_langgraph_workflow(self):
         workflow = StateGraph(GraphState)
-        
-        # Add Nodes
-        workflow.add_node("check_cache", self.check_cache_node)
-        workflow.add_node("rewrite_query", self.rewrite_query_node)
-        workflow.add_node("context_generation", self.context_generation_node)
-        workflow.add_node("response_generation", self.response_generation_node)
-        workflow.add_node("cache_update", self.cache_update_node)
+        workflow.add_node("retrieve",         self.retrieve_node)
+        workflow.add_node("web_search",        self.web_search_node)
+        workflow.add_node("self_learn",        self.self_learn_node)
+        workflow.add_node("knowledge_inject",  self.knowledge_inject_node)
+        workflow.add_node("action",            self.action_node)
+        workflow.add_node("respond",           self.response_node)
 
-        # Logic
-        workflow.add_edge(START, "check_cache")
-        
-        def should_run_rag(state):
-            return "run_rag" if not state["cache_hit"] else "end"
-            
+        def router(state):
+            msg = state["messages"][-1].content.lower().strip()
+            # Knowledge injection
+            if any(msg.startswith(t) for t in ["jarvis, note that", "jarvis note that"]):
+                return "inject"
+            # Quick-learn
+            if "remember" in msg or "save this" in msg:
+                return "learn"
+            # Executive actions
+            action_triggers = ["play ", "open ", "send whatsapp", "audit ", "open youtube"]
+            if any(msg.startswith(t) or t in msg for t in action_triggers):
+                return "act"
+            # Web fallback
+            if not state.get("documents") or len(state["documents"]) == 0:
+                return "web"
+            return "answer"
+
+        workflow.add_edge(START, "retrieve")
         workflow.add_conditional_edges(
-            "check_cache",
-            should_run_rag,
-            {
-                "run_rag": "rewrite_query", 
-                "end": END
-            }
+            "retrieve", router,
+            {"inject": "knowledge_inject", "learn": "self_learn",
+             "act": "action", "web": "web_search", "answer": "respond"}
         )
-        
-        workflow.add_edge("rewrite_query", "context_generation")
-        workflow.add_edge("context_generation", "response_generation")
-        workflow.add_edge("response_generation", "cache_update")
-        workflow.add_edge("cache_update", END)
-
+        workflow.add_edge("web_search",       "respond")
+        workflow.add_edge("self_learn",        END)
+        workflow.add_edge("knowledge_inject",  END)
+        workflow.add_edge("action",            END)
+        workflow.add_edge("respond",           END)
         return workflow.compile(checkpointer=self.memory)
 
-    # --- Run Method ---
-    def run_chat(self):
-        
-        current_user_id = input("Enter User ID (e.g., 'alice', 'bob'): ").strip()
-        if not current_user_id: current_user_id = "default_user"
-        
-        thread_id = str(uuid.uuid4())
-        config = {"configurable": {"thread_id": thread_id}}
-        
-        print(f"Logged in as: {current_user_id}")
-        print(f"Session ID: {thread_id}")
-        print("Type 'quit' to exit.")
-        
-        while True:
-            user_input = input(f"\n{current_user_id}: ")
-            if user_input.lower() in ["quit", "exit"]: 
-                break
-            if not user_input.strip(): 
-                continue
-            
-            # Pass inputs to graph
-            inputs = {
-                "messages": [HumanMessage(content=user_input)],
-                "user_id": current_user_id
-            }
-            
-            final_answer = ""
-            try:
-                for event in self.app.stream(inputs, config, stream_mode="values"):
-                    messages = event.get("messages", [])
-                    if messages and isinstance(messages[-1], AIMessage):
-                        current_content = messages[-1].content
-                        if current_content != final_answer:
-                            print(f"\rAI: {current_content}", end="", flush=True)
-                            final_answer = current_content
-                            
-            except Exception as e:
-                print(f"Error during execution: {e}") 
-if __name__ == "__main__":
+
+# ==================================================================
+# 3. SERVER INITIALIZATION
+# ==================================================================
+# ── Pre-flight: ensure Ollama is up before we build the pipeline ─────────────
+_ensure_ollama_running()
+
+app      = FastAPI(title="JARVIS Mainframe", version="2.0-autonomous")
+pipeline = RAGPipeline()
+
+# -- Wire up the live file observer (watches ./data for new knowledge) --
+try:
+    from file_observer import start_observer
+    start_observer(pipeline, pipeline.DATA_DIR)
+except ImportError:
+    print("[WARN]: file_observer not found. Live re-index on file change disabled.")
+
+
+class Query(BaseModel):
+    user_id: str
+    text: str
+
+class TeachPayload(BaseModel):
+    user_id:   str
+    knowledge: str
+
+
+@app.post("/ask_jarvis")
+async def ask_jarvis(query: Query):
+    shortcut_hint = pipeline._check_shortcut(query.text)
     try:
-        pipeline = RAGPipeline()
-        pipeline.run_chat()
-            
+        inputs = {
+            "messages": [HumanMessage(content=query.text)],
+            "user_id":  query.user_id,
+            "question": query.text
+        }
+        config = {"configurable": {"thread_id": query.user_id}}
+        result = pipeline.app.invoke(inputs, config)
+        answer = result.get("answer", "Jarvis did not return an answer.")
+        pipeline._log_usage(query.user_id, query.text, "ok")
+        return {"answer": answer + shortcut_hint}
     except Exception as e:
-        print(f"\nFatal Error: {e}")
+        import traceback
+        pipeline._log_health(f"Endpoint crash: {traceback.format_exc()}")
+        pipeline._log_usage(query.user_id, query.text, f"error: {e}")
+        return {"answer": f"Apologies, Sir. A hiccup in the RAG node: {str(e)}"}
+
+
+@app.post("/teach")
+async def teach(payload: TeachPayload):
+    """Explicit knowledge injection endpoint."""
+    ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = os.path.join(pipeline.DATA_DIR, f"injected_{ts}.md")
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(f"# Injected Knowledge - {ts}\n\n{payload.knowledge}\n")
+    threading.Thread(target=pipeline.reindex, daemon=True).start()
+    return {"status": "Knowledge committed and re-indexing in progress, Sir."}
+
+
+@app.get("/status")
+async def status():
+    uptime      = str(datetime.datetime.now() - pipeline.start_time).split(".")[0]
+    doc_count   = len(pipeline.documents)  if pipeline.documents   else 0
+    chunk_count = len(pipeline.chunks)     if pipeline.chunks      else 0
+    vec_count   = pipeline.vector_store._collection.count() if pipeline.vector_store else 0
+    return {
+        "status":      "JARVIS ONLINE",
+        "uptime":      uptime,
+        "llm_model":   "llama3.2 (Ollama)",
+        "documents":   doc_count,
+        "chunks":      chunk_count,
+        "vectors":     vec_count,
+        "health_log":  pipeline.HEALTH_LOG,
+        "usage_log":   pipeline.USAGE_LOG,
+        "message":     "All systems nominal, Sir."
+    }
+
+
+# ==================================================================
+# 4. WEBSOCKET — Persistent Mobile Bridge
+# ==================================================================
+_ws_connections: list[WebSocket] = []
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    _ws_connections.append(ws)
+    print(f"[WebSocket]: Phone connected from {ws.client.host}")
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {"user_id": "Dwijas", "text": raw}
+
+            user_id = data.get("user_id", "Dwijas")
+            text    = data.get("text", "").strip()
+            if not text:
+                continue
+
+            shortcut_hint = pipeline._check_shortcut(text)
+            inputs = {"messages": [HumanMessage(content=text)], "user_id": user_id, "question": text}
+            config = {"configurable": {"thread_id": user_id}}
+            result = pipeline.app.invoke(inputs, config)
+            answer = result.get("answer", "No answer from JARVIS.") + shortcut_hint
+            pipeline._log_usage(user_id, text, "ws_ok")
+            await ws.send_text(json.dumps({"answer": answer}))
+    except WebSocketDisconnect:
+        _ws_connections.remove(ws)
+        print("[WebSocket]: Phone disconnected.")
+    except Exception as e:
+        pipeline._log_health(f"WebSocket error: {e}")
+        _ws_connections.remove(ws)
+
+
+async def ws_broadcast(message: str):
+    """Push a message to all connected phones (watchdog recovery alerts etc.)"""
+    for ws in list(_ws_connections):
+        try:
+            await ws.send_text(json.dumps({"answer": message}))
+        except Exception:
+            _ws_connections.remove(ws)
+
+
+# ==================================================================
+# 5. VOICE ENDPOINT — Whisper STT + Edge-TTS
+# ==================================================================
+@app.post("/voice")
+async def voice_endpoint(file: UploadFile = File(...), user_id: str = "Dwijas"):
+    """Upload audio → transcribe → pipeline → TTS response MP3."""
+    import tempfile, asyncio
+    try:
+        from voice_io import transcribe, speak_async
+    except ImportError:
+        return {"error": "voice_io module not found. Install faster-whisper and edge-tts."}
+
+    # Save upload to temp file
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    try:
+        # Transcribe
+        text = transcribe(tmp_path)
+        if not text:
+            return {"error": "Could not transcribe audio. Please speak clearly, Sir."}
+
+        # Run through pipeline
+        inputs = {"messages": [HumanMessage(content=text)], "user_id": user_id, "question": text}
+        config = {"configurable": {"thread_id": user_id}}
+        result = pipeline.app.invoke(inputs, config)
+        answer = result.get("answer", "I have no answer for that, Sir.")
+        pipeline._log_usage(user_id, text, "voice_ok")
+
+        # Generate TTS
+        tts_path = await speak_async(answer)
+        from fastapi.responses import FileResponse
+        return FileResponse(tts_path, media_type="audio/mpeg",
+                            headers={"X-Transcript": text, "X-Answer": answer[:200]})
+    finally:
+        os.unlink(tmp_path)
+
+
+# ==================================================================
+# 6. VISION ENDPOINT — Gemini Image Analysis
+# ==================================================================
+@app.post("/vision")
+async def vision_endpoint(file: UploadFile = File(...), prompt: str = None):
+    """Upload image/screenshot → Gemini Vision analysis."""
+    try:
+        from vision_module import analyze_image_bytes
+    except ImportError:
+        return {"error": "vision_module not found. Install google-generativeai."}
+
+    image_bytes = await file.read()
+    analysis    = analyze_image_bytes(image_bytes, file.filename or "upload.png", prompt)
+    return {"analysis": analysis, "filename": file.filename}
+
+
+# --- START SERVER ---
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
