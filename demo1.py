@@ -1,3 +1,9 @@
+"""
+Project: Jarvis Mainframe - Local Hybrid RAG Pipeline
+Author: Dwijas Vompigadda (dwijasv@gmail.com)
+Date: February 2026
+Description: A stateful AI agent using LangGraph and Ollama.
+"""
 import sys, json, os, gc, uuid, threading, datetime, atexit, signal, subprocess, time
 import requests as _requests  # for Ollama model eviction
 from typing import TypedDict, List, Annotated, Optional
