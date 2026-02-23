@@ -1,0 +1,8 @@
+langchain-ollama
+langgraph
+langchain-community
+chromadb
+rank_bm25
+numpy
+fastapi
+uvicorn
